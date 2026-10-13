@@ -1,0 +1,215 @@
+name: Build Linux (single platform)
+
+# Single-platform build na potrzeby uruchomienia w WSL2.
+#
+# Po co to osobno: .github/workflows/build-cpp.yml odpala 5 platform naraz
+# (Windows x64/ARM64, Linux, macOS ARM64/x64). Runnery macOS liczą się jako 10x
+# wobec limitu darmowego konta, wiec taki przebieg konczy sie bledem kredytow.
+# Ten workflow buduje wylacznie Linux x64 (1x) i wgrywa sam binarny build.
+#
+# Uruchomienie (wymaga fork-a + gh auth):
+#   gh workflow run build-linux.yml --repo <twoj-user>/FinceptTerminal
+#   gh run watch
+#   gh run download --name FinceptTerminal-Linux-x64-build
+
+on:
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+  QT_VERSION: "6.8.3"
+  # Identyczna lista co w build-cpp.yml. qtserialport jest potrzebny tylko po to,
+  # by linuxdeployqt potrafil rozwiązać zaleznosc Qt6SerialPort - aplikacja
+  # serialowego GPS nie uzywa.
+  QT_MODULES: "qtcharts qtwebsockets qtmultimedia qtwebengine qtwebchannel qtpositioning qtserialport"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    name: Linux x64
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: linux-${{ env.QT_VERSION }}
+          max-size: 500M
+          update-package-index: true
+
+      # Ubuntu 22.04 ma domyslnie g++ 11.4, a CMakeLists wymaga GCC 12.3+.
+      # apt Qt (6.2) nigdy nie spelni pinu 6.8, wiec Qt leci z install-qt-action.
+      - name: Install system dependencies
+        run: |
+          sudo add-apt-repository universe -y
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake ninja-build gcc-12 g++-12 \
+            libssl-dev \
+            libsecret-1-dev \
+            libgl1-mesa-dev libglu1-mesa-dev \
+            libxkbcommon-dev libxkbcommon-x11-0 libxkbcommon-x11-dev \
+            libxcb-cursor0 libxcb-cursor-dev \
+            libxcb-icccm4 libxcb-icccm4-dev \
+            libxcb-image0 libxcb-image0-dev \
+            libxcb-keysyms1 libxcb-keysyms1-dev \
+            libxcb-randr0 \
+            libxcb-render-util0 libxcb-render-util0-dev \
+            libxcb-shape0-dev libxcb-sync-dev libxcb-xfixes0-dev libxcb-xfixes0-dev \
+            libxcb-xinerama0 libxcb-xinerama0-dev \
+            libxcb-xkb1 \
+            libdbus-1-dev libfontconfig1-dev libfreetype6-dev \
+            pkg-config zip
+          echo "CC=gcc-12"  >> "$GITHUB_ENV"
+          echo "CXX=g++-12" >> "$GITHUB_ENV"
+
+      - name: Install Qt6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: linux_gcc_64
+          modules: ${{ env.QT_MODULES }}
+          cache: true
+          cache-key-prefix: qt-linux-x64
+
+      # yt-dlp - bundled dla odtwarzania wideo na pulpicie.
+      # Pillow - repo nie zawiera zadnej ikony aplikacji (resources/icons/ jest
+      # pusty), wiec "Assemble AppDir" generuje 256x256 PNG w razie braku
+      # app_icon_256.png. Bez Pillow konczy sie to ModuleNotFoundError, tak jak
+      # w przebiegu 37977878914.
+      - name: Install Python helpers
+        run: pip install yt-dlp Pillow
+
+      # aqtinstall shipuje pliki konfiguracyjne CMake dla sterownikow Qt6Sql
+      # (MySQL/PSQL/ODBC/Mimer), ale NIE binaria tych sterownikow, przez co
+      # find_package(Qt6 ... Sql) wywala sie na etapie konfiguracji. Uzywamy
+      # tylko SQLite. Musi zadzadzic przed "Configure CMake".
+      - name: Remove dangling Qt SQL driver plugin CMake configs
+        shell: bash
+        run: |
+          set -euo pipefail
+          SQL_CMAKE="${QT_ROOT_DIR}/lib/cmake/Qt6Sql"
+          if [ -d "${SQL_CMAKE}" ]; then
+            for drv in QMYSQLDriverPlugin QPSQLDriverPlugin QODBCDriverPlugin QMimerSQLDriverPlugin; do
+              rm -fv "${SQL_CMAKE}/Qt6${drv}"*.cmake || true
+            done
+          else
+            echo "::warning::${SQL_CMAKE} not found - skipping SQL plugin config cleanup"
+          fi
+
+      - name: Configure CMake
+        working-directory: fincept-qt
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCMAKE_PREFIX_PATH="${QT_ROOT_DIR}" \
+            -DOPENSSL_ROOT_DIR=/usr \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DFINCEPT_REQUIRE_BUNDLED_YTDLP=ON
+
+      - name: Build
+        working-directory: fincept-qt
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel $(nproc)
+
+      - name: Verify build output
+        working-directory: fincept-qt
+        run: |
+          set -euo pipefail
+          BINARY="build/FinceptTerminal"
+          if [ ! -f "$BINARY" ]; then
+            echo "::error::Binary not found at $BINARY"
+            find build -maxdepth 3 -name "FinceptTerminal" 2>/dev/null || true
+            exit 1
+          fi
+          chmod +x "$BINARY"
+          echo "Binary verified: $BINARY ($(du -sh "$BINARY" | cut -f1))"
+
+      # Weryfikacja bezposrednio przez sprawdzenie zawartosci bundle'a Qt,
+      # zamiast uruchamiania binarki. Uruchomienie w jobie wymagaloby xvfb
+      # Binarny z linku jest sam w sobie bezużyteczny - bez Qt runtime'owych
+      # bibliotek i pluginów odmówi startu. Upstream buduje AppImage przez
+      # linuxdeploy; tutaj wystarczy AppDir, bo i tak nie zostanie odpalony
+      # bez WSL + VT-x, a AppImage dodaje ~100 linii obslugi edge case'ow
+      # (stripowanie sterownikow SQL, bundled libssl/libcrypto jako para).
+      - name: Assemble AppDir (Qt runtime)
+        working-directory: fincept-qt
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p AppDir/usr/bin
+
+          cp build/FinceptTerminal AppDir/usr/bin/
+          chmod +x AppDir/usr/bin/FinceptTerminal
+          cp -r resources AppDir/usr/bin/resources 2>/dev/null || true
+          # Skrypt lezy w <repo>/.github/scripts, a ten krok ma working-directory:
+          # fincept-qt - sciezka wzgledna ".github/scripts/..." siegla o katalog
+          # za daleko i konczy sie "No such file or directory" (exit 127).
+          bash "$GITHUB_WORKSPACE/.github/scripts/sync_scripts.sh" scripts AppDir/usr/bin/scripts
+
+          QTBIN="$(dirname "$(which qmake6 || which qmake)")"
+          echo "Qt bin: $QTBIN"
+
+          # rdzen Qt + wszystkie modulow wymaganych przez target_link_libraries
+          for so in Core Gui Widgets Network Sql Charts Concurrent PrintSupport; do
+            cp -a "$QTBIN"/libQt6${so}.so* AppDir/usr/bin/ 2>/dev/null || true
+          done
+
+          # WebSockets i Multimedia sa opcjonalne w CMake, ale modul krypto
+          # stoi na WebSockets, wiec dokladamy tez te dwa.
+          for so in WebSockets Multimedia MultimediaWidgets; do
+            cp -a "$QTBIN"/libQt6${so}.so* AppDir/usr/bin/ 2>/dev/null || true
+          done
+
+          # Platformowy plugin xcb - bez niego Qt nie ma jak otworzyc okna
+          mkdir -p AppDir/usr/bin/platforms
+          cp -a "$QTBIN"/../plugins/platforms/libqxcb.so AppDir/usr/bin/platforms/ 2>/dev/null || true
+
+          # Sterowniki SQL: SQLite ma, reszta odpada (jak w build-cpp.yml - plugin
+          # Mimer ciagnie libmimerapi.so, ktorego na runnerze nie ma i deploy pada).
+          mkdir -p AppDir/usr/bin/sqldrivers
+          cp -a "$QTBIN"/../plugins/sqldrivers/libqsqlite.so AppDir/usr/bin/sqldrivers/ 2>/dev/null || true
+
+          # Platforma + ikona + ikony
+          mkdir -p AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          printf '[Desktop Entry]\nName=Fincept Terminal\nExec=FinceptTerminal\nIcon=fincept-terminal\nType=Application\nCategories=Finance;\n' \
+            > AppDir/usr/share/applications/fincept-terminal.desktop
+          # Ikona jest kosmetyczna - bez linuxdeploy nic jej nie wymaga, wiec
+          # jej brak nie moze wywracac przebiegu (to wlasnie zrobilo w 37977878914).
+          ICON_DEST="AppDir/usr/share/icons/hicolor/256x256/apps/fincept-terminal.png"
+          if [ -f resources/icons/app_icon_256.png ]; then
+            cp resources/icons/app_icon_256.png "$ICON_DEST"
+          elif python3 -c 'from PIL import Image; Image.new("RGBA",(256,256),(26,26,46,255)).save(__import__("sys").argv[1],"PNG")' "$ICON_DEST" 2>/dev/null; then
+            echo "wygenerowano ikone zastepcza"
+          else
+            echo "::warning::nie udalo sie wygenerowac ikony - pomijam (aplikacja tego nie wymaga)"
+          fi
+
+          # Kontrola jakosciowa - glowna wczesniejsza wersja tego workflow
+          # padala wlasnie tutaj: sprawdzala libQt6Core.so, ktorego nikt
+          # jeszcze nie skopiowal, bo nie bylo kroku deploy.
+          # Raportujemy WSZYSTKIE braki naraz, nie tylko pierwszy - inaczej
+          # kolejny przebieg znowu zgaduje po jednym pliku.
+          missing=0
+          for f in AppDir/usr/bin/libQt6Core.so.6 AppDir/usr/bin/libQt6Gui.so.6 \
+                   AppDir/usr/bin/libQt6Widgets.so.6 AppDir/usr/bin/libQt6Network.so.6 \
+                   AppDir/usr/bin/libQt6Sql.so.6 AppDir/usr/bin/libQt6Charts.so.6 \
+                   AppDir/usr/bin/platforms/libqxcb.so; do
+            if [ ! -e "$f" ]; then echo "::error::brak $f"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "AppDir OK"
+          ls -la AppDir/usr/bin/
+          echo "--- brakujace zaleznosci (nie powinno byc ani jednej) ---"
+          ldd AppDir/usr/bin/FinceptTerminal | grep "not found" || echo "brak - wszystko rozwiązane"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FinceptTerminal-Linux-x64-build
+          path: fincept-qt/AppDir
+          retention-days: 14
+          if-no-files-found: error
